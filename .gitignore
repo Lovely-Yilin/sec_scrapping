@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .cursor/
+strict_csv_out/
