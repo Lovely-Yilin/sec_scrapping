@@ -38,18 +38,17 @@ def parse_all_tables(
 
         padded_rows = [row + [""] * (max_width - len(row)) for row in rows]
         padded_rows = delete_empty_columns(padded_rows)
-        padded_rows = deduplicate_columns_by_data_values(padded_rows)
-        width = len(padded_rows[0]) if padded_rows else 0
+        columns, header_rows, data_rows = _extract_columns_and_data_rows(padded_rows)
         results.append(
             {
                 "index": index,
                 "heading": "",
                 "table_html": str(table),
                 "rows": padded_rows,
-                "columns": [f"Column {i + 1}" for i in range(width)],
-                "header_rows": [],
-                "data_rows": padded_rows,
-                "text": "\n".join(" | ".join(row) for row in padded_rows),
+                "columns": columns,
+                "header_rows": header_rows,
+                "data_rows": data_rows,
+                "text": "\n".join(" | ".join(row) for row in data_rows),
             }
         )
 
@@ -138,34 +137,116 @@ def delete_empty_columns(rows: List[List[str]]) -> List[List[str]]:
     return [[row[col_idx] for col_idx in keep_indices] for row in padded_rows]
 
 
-def deduplicate_columns_by_data_values(rows: List[List[str]]) -> List[List[str]]:
-    """
-    Remove duplicate columns when all non-header cell values are identical.
+def _drop_empty_columns(rows: List[List[str]]) -> List[List[str]]:
+    return delete_empty_columns(rows)
 
-    Header row (row index 0) is ignored for duplicate detection.
+
+def _extract_columns_and_data_rows(rows: List[List[str]]) -> Tuple[List[str], List[List[str]], List[List[str]]]:
+    """
+    Determine first data row and build column names.
+
+    Rules:
+    - First column is row label and excluded from first-data-row detection.
+    - First data row is either all-empty (except first column), or has at least one numeric-like
+      value/sign in non-first columns. Date-like values do not count as numeric-like.
+    - Header rows are all rows above first data row.
+    - If no data row is detected, use first row as column names.
     """
     if not rows:
-        return rows
-    if len(rows) <= 1:
-        return rows
+        return [], [], []
 
     width = max(len(row) for row in rows)
     padded_rows = [row + [""] * (width - len(row)) for row in rows]
 
-    keep_indices = []
-    seen_signatures = set()
-    for col_idx in range(width):
-        signature = tuple(padded_rows[row_idx][col_idx] for row_idx in range(1, len(padded_rows)))
-        if signature in seen_signatures:
+    first_data_idx = _find_first_data_row_index(padded_rows)
+    if first_data_idx is None:
+        columns = []
+        for i, cell in enumerate(padded_rows[0]):
+            value = cell.strip()
+            if i == 0:
+                columns.append(value)
+            else:
+                columns.append(value or f"Column {i + 1}")
+        return columns, [padded_rows[0]], padded_rows[1:]
+
+    header_rows = padded_rows[:first_data_idx]
+    data_rows = padded_rows[first_data_idx:]
+    columns = _build_combined_column_names(header_rows, width)
+    return columns, header_rows, data_rows
+
+
+def _find_first_data_row_index(rows: List[List[str]]) -> Optional[int]:
+    for idx, row in enumerate(rows):
+        non_label_cells = row[1:] if len(row) > 1 else []
+        if not non_label_cells:
             continue
-        seen_signatures.add(signature)
-        keep_indices.append(col_idx)
+        if all(not cell.strip() for cell in non_label_cells):
+            return idx
+        if any(_is_numeric_like_non_date(cell) for cell in non_label_cells):
+            return idx
+    return None
 
-    return [[row[col_idx] for col_idx in keep_indices] for row in padded_rows]
+
+def _build_combined_column_names(header_rows: List[List[str]], width: int) -> List[str]:
+    if not header_rows:
+        return [f"Column {i + 1}" for i in range(width)]
+
+    columns: List[str] = []
+    for col_idx in range(width):
+        parts = []
+        for row in header_rows:
+            value = row[col_idx].strip() if col_idx < len(row) else ""
+            if value:
+                parts.append(value)
+        if parts:
+            columns.append(" - ".join(parts))
+        elif col_idx == 0:
+            columns.append("")
+        else:
+            columns.append(f"Column {col_idx + 1}")
+    return columns
 
 
-def _drop_empty_columns(rows: List[List[str]]) -> List[List[str]]:
-    return delete_empty_columns(rows)
+def _is_numeric_like_non_date(value: str) -> bool:
+    s = (value or "").strip()
+    if not s:
+        return False
+    if _is_date_like(s):
+        return False
+    if _is_numeric_sign_only(s):
+        return True
+
+    normalized = s.replace(",", "")
+    if normalized.startswith("(") and normalized.endswith(")"):
+        normalized = normalized[1:-1].strip()
+    normalized = normalized.replace("$", "").replace("%", "").strip()
+    if normalized.startswith(("+", "-")):
+        normalized = normalized[1:].strip()
+
+    if not normalized:
+        return False
+    return bool(re.fullmatch(r"\d+(\.\d+)?", normalized))
+
+
+def _is_numeric_sign_only(value: str) -> bool:
+    s = (value or "").strip()
+    return s in {"-", "--", "—", "%", "$", "()", "( )"}
+
+
+def _is_date_like(value: str) -> bool:
+    s = (value or "").strip()
+    if not s:
+        return False
+
+    patterns = [
+        r"^\d{4}$",  # 2023, 2024
+        r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$",  # 9/30/2025, 09-30-25
+        r"^\d{4}[/-]\d{1,2}[/-]\d{1,2}$",  # 2025-09-30
+        r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{2,4}$",  # Sep 30, 2025
+        r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{2,4}$",  # Sep 2025
+    ]
+    lowered = s.lower()
+    return any(re.fullmatch(p, lowered) for p in patterns)
 
 
 def _cell_text(cell) -> str:
