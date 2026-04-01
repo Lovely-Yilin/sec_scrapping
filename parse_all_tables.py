@@ -2,9 +2,10 @@
 """Extract all HTML tables from a single SEC filing URL using parser_new."""
 
 import argparse
-import csv
 import json
+import re
 from pathlib import Path
+from datetime import datetime
 
 from parser import FILING_URL, HEADERS, parse_all_tables
 
@@ -23,11 +24,53 @@ def _safe_slug(text):
     return slug.strip("_") or "table"
 
 
-def _write_strict_csvs(tables, out_dir):
+def _make_sheet_name(index, heading, used_names):
+    base = f"t{index:03d}_{_safe_slug(heading)}"
+    # Excel worksheet names must be <= 31 chars and unique per workbook.
+    base = base[:31] or f"t{index:03d}"
+    candidate = base
+    suffix_num = 1
+    while candidate in used_names:
+        suffix = f"_{suffix_num}"
+        candidate = (base[: 31 - len(suffix)] + suffix)[:31]
+        suffix_num += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def _derive_output_stem(url):
+    # Prefer the filing filename stem from URL, e.g. nflx-20251231.htm -> nflx-20251231.
+    stem_match = re.search(r"/([^/?#]+)\.htm(?:[?#].*)?$", url or "", flags=re.IGNORECASE)
+    if stem_match:
+        stem = stem_match.group(1).strip()
+        if stem:
+            return stem
+
+    # Fallback to date-based naming when URL does not contain a .htm filename.
+    matches = re.findall(r"\b(20\d{6})\b", url or "")
+    date_part = matches[-1] if matches else datetime.today().strftime("%Y%m%d")
+    return f"filing-{date_part}"
+
+
+def _write_all_tables_excel(tables, out_dir, url):
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:
+        raise RuntimeError("openpyxl is required to write Excel output. Install with: pip install openpyxl") from exc
+
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    written = []
 
+    file_stem = _derive_output_stem(url)
+    excel_path = out_path / f"{file_stem}.xlsx"
+
+    wb = Workbook()
+    # Remove the default empty sheet so only parsed tables are present.
+    default_ws = wb.active
+    wb.remove(default_ws)
+
+    used_sheet_names = set()
+    written_count = 0
     for t in tables:
         columns = list(t.get("columns") or [])
         data_rows = [list(r) for r in (t.get("data_rows") or [])]
@@ -39,20 +82,26 @@ def _write_strict_csvs(tables, out_dir):
             columns = [f"Column {i + 1}" for i in range(width)]
             data_rows = [list(r) + [""] * (width - len(r)) for r in rows]
 
-        if not data_rows:
+        if not columns and not data_rows:
             continue
 
         width = len(columns)
         padded_data = [r + [""] * (width - len(r)) for r in data_rows]
-        heading = _safe_slug(t.get("heading", ""))
-        file_name = f"table_{t['index']:03d}_{heading}.csv"
-        csv_path = out_path / file_name
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(columns)
-            writer.writerows(padded_data)
-        written.append(str(csv_path))
-    return written
+        sheet_name = _make_sheet_name(t["index"], t.get("heading", ""), used_sheet_names)
+        ws = wb.create_sheet(title=sheet_name)
+        ws.append(columns)
+        for row in padded_data:
+            ws.append(row)
+        written_count += 1
+
+    # If no table is usable, keep one sheet explaining the result.
+    if not wb.worksheets:
+        ws = wb.create_sheet(title="tables")
+        ws.append(["No tables with writable rows were found."])
+
+    # save() overwrites an existing file with the same name.
+    wb.save(excel_path)
+    return str(excel_path), written_count
 
 
 def main():
@@ -70,7 +119,7 @@ def main():
     ap.add_argument(
         "--strict-csv-dir",
         default="",
-        help="Optional directory to write one fixed-width CSV per table.",
+        help="Optional directory to write a single Excel file with one sheet per table.",
     )
     args = ap.parse_args()
 
@@ -93,8 +142,8 @@ def main():
         print(f"Wrote full table payload to {args.output_json}")
 
     if args.strict_csv_dir:
-        written = _write_strict_csvs(tables, args.strict_csv_dir)
-        print(f"Wrote {len(written)} strict CSV files to {args.strict_csv_dir}")
+        excel_path, count = _write_all_tables_excel(tables, args.strict_csv_dir, args.url)
+        print(f"Wrote {count} tables to Excel file: {excel_path}")
 
 
 if __name__ == "__main__":

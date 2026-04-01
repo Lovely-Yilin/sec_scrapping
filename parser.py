@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 
 
 HEADERS = {"User-Agent": "1010cyl@gmail.com"}
+CURRENCY_SIGNS = "$€£¥₹₩₽¢"
 
 BASE_URL = "https://www.sec.gov/Archives/edgar/data/313927/000119312525260515"
 FILING_URL = f"{BASE_URL}/chd-20250930.htm"
@@ -36,9 +37,14 @@ def parse_all_tables(
         if not rows:
             continue
 
+        rows = deduplicate_columns(rows)
+        rows = merge_adjacent_sign_columns(rows)
+
+        max_width = max(len(row) for row in rows)
         padded_rows = [row + [""] * (max_width - len(row)) for row in rows]
         padded_rows = delete_empty_columns(padded_rows)
         columns, header_rows, data_rows = _extract_columns_and_data_rows(padded_rows)
+        _normalize_parenthesized_negative_values(data_rows)
         results.append(
             {
                 "index": index,
@@ -48,11 +54,28 @@ def parse_all_tables(
                 "columns": columns,
                 "header_rows": header_rows,
                 "data_rows": data_rows,
-                "text": "\n".join(" | ".join(row) for row in data_rows),
+                "text": "\n".join(
+                    [" | ".join(columns)] + [" | ".join(row) for row in data_rows]
+                ),
             }
         )
 
     return results
+
+
+def _raw_column_names_from_headers(header_rows: List[List[str]], width: int) -> List[str]:
+    """
+    Build column names from header text only (no synthetic fallback names).
+    """
+    names: List[str] = []
+    for col_idx in range(width):
+        parts: List[str] = []
+        for row in header_rows:
+            value = row[col_idx].strip() if col_idx < len(row) else ""
+            if value:
+                parts.append(value)
+        names.append(" - ".join(parts).strip())
+    return names
 
 
 def _expand_table_with_spans(table_tag) -> Tuple[List[List[str]], int]:
@@ -129,16 +152,211 @@ def delete_empty_columns(rows: List[List[str]]) -> List[List[str]]:
     width = max(len(row) for row in rows)
     padded_rows = [row + [""] * (width - len(row)) for row in rows]
 
+    first_data_idx = _find_first_data_row_index(padded_rows)
+    if first_data_idx is None:
+        # No detected data rows: all columns are treated as header-only and dropped.
+        return [[] for _ in padded_rows]
+
+    data_rows = padded_rows[first_data_idx:]
+
     keep_indices = []
     for col_idx in range(width):
-        if any(padded_rows[row_idx][col_idx].strip() for row_idx in range(len(padded_rows))):
+        has_data_content = any(
+            data_rows[row_idx][col_idx].strip() for row_idx in range(len(data_rows))
+        )
+        if has_data_content:
             keep_indices.append(col_idx)
 
     return [[row[col_idx] for col_idx in keep_indices] for row in padded_rows]
 
 
+def deduplicate_columns(rows: List[List[str]]) -> List[List[str]]:
+    """
+    Remove duplicate columns by exact full-column equality, including header cells.
+    """
+    if not rows:
+        return rows
+
+    width = max(len(row) for row in rows)
+    padded_rows = [row + [""] * (width - len(row)) for row in rows]
+
+    seen_column_signatures = set()
+    keep_indices: List[int] = []
+
+    for col_idx in range(width):
+        signature = tuple(row[col_idx] for row in padded_rows)
+        if signature not in seen_column_signatures:
+            seen_column_signatures.add(signature)
+            keep_indices.append(col_idx)
+
+    return [[row[col_idx] for col_idx in keep_indices] for row in padded_rows]
+
+
+def merge_adjacent_sign_columns(rows: List[List[str]]) -> List[List[str]]:
+    """
+    Merge sign-only adjacent columns into the current value column.
+
+    Rules implemented:
+    - Prefix merge from previous adjacent column when the previous cell is a
+      currency sign marker (supports forms like "$", "($", "€", "(€").
+    - Suffix merge from next adjacent column when the next cell is a percent
+      marker (supports "%" and "%)").
+    - Prefix merge candidates must have the same header-derived column name
+      between source and target columns (when header names are present).
+    - Never merge numeric content from adjacent cells, only sign markers.
+    - Drop adjacent source columns used for merging, even if they contain
+      non-sign values in some rows.
+    """
+    if not rows:
+        return rows
+
+    width = max(len(row) for row in rows)
+    padded_rows = [row + [""] * (width - len(row)) for row in rows]
+
+    first_data_idx = _find_first_data_row_index(padded_rows)
+    if first_data_idx is None:
+        first_data_idx = len(padded_rows)
+
+    data_rows = padded_rows[first_data_idx:]
+    if not data_rows:
+        return padded_rows
+
+    header_rows = padded_rows[:first_data_idx]
+    raw_header_names = _raw_column_names_from_headers(header_rows, width)
+
+    prefix_merge_targets: set[int] = set()
+    suffix_merge_targets: set[int] = set()
+
+    for col_idx in range(1, width):
+        left_name = _normalize_marker(raw_header_names[col_idx - 1])
+        curr_name = _normalize_marker(raw_header_names[col_idx])
+        if left_name and curr_name and left_name != curr_name:
+            continue
+
+        marker_rows = 0
+        mergeable_rows = 0
+        for row in data_rows:
+            marker = _normalize_marker(row[col_idx - 1])
+            value = row[col_idx].strip()
+            if marker and _is_currency_prefix_marker(marker):
+                marker_rows += 1
+                if value:
+                    mergeable_rows += 1
+        if marker_rows and mergeable_rows:
+            prefix_merge_targets.add(col_idx)
+
+    for col_idx in range(width - 1):
+        marker_rows = 0
+        mergeable_rows = 0
+        for row in data_rows:
+            marker = _normalize_marker(row[col_idx + 1])
+            value = row[col_idx].strip()
+            if marker and _is_percent_suffix_marker(marker):
+                marker_rows += 1
+                if value:
+                    mergeable_rows += 1
+        if marker_rows and mergeable_rows:
+            suffix_merge_targets.add(col_idx)
+
+    for row in data_rows:
+        for col_idx in prefix_merge_targets:
+            marker = _normalize_marker(row[col_idx - 1])
+            value = row[col_idx].strip()
+            if marker and value and _is_currency_prefix_marker(marker):
+                if not _normalize_marker(value).startswith(marker):
+                    row[col_idx] = f"{marker}{value}"
+                row[col_idx - 1] = ""
+
+        for col_idx in suffix_merge_targets:
+            marker = _normalize_marker(row[col_idx + 1])
+            value = row[col_idx].strip()
+            if marker and value and _is_percent_suffix_marker(marker):
+                if not _normalize_marker(value).endswith(marker):
+                    row[col_idx] = f"{value}{marker}"
+                row[col_idx + 1] = ""
+
+    drop_indices = {col_idx - 1 for col_idx in prefix_merge_targets}
+    drop_indices.update(col_idx + 1 for col_idx in suffix_merge_targets)
+    if not drop_indices:
+        return padded_rows
+
+    keep_indices = [idx for idx in range(width) if idx not in drop_indices]
+    return [[row[idx] for idx in keep_indices] for row in padded_rows]
+
+
 def _drop_empty_columns(rows: List[List[str]]) -> List[List[str]]:
     return delete_empty_columns(rows)
+
+
+def _normalize_marker(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip())
+
+
+def _normalize_parenthesized_negative_values(data_rows: List[List[str]]) -> None:
+    """
+    Convert parenthesized numeric strings to negative values in value cells only.
+
+    This intentionally skips:
+    - header rows (caller passes data rows only)
+    - row-label cells (first column in each data row)
+    """
+    for row in data_rows:
+        for col_idx in range(1, len(row)):
+            row[col_idx] = _convert_parenthesized_numeric_to_negative(row[col_idx])
+
+
+def _convert_parenthesized_numeric_to_negative(value: str) -> str:
+    s = (value or "").strip()
+    if not s:
+        return value
+
+    normalized = _normalize_marker(s)
+    currency_class = re.escape(CURRENCY_SIGNS)
+    number = r"\d[\d,]*(?:\.\d+)?"
+
+    patterns = [
+        # (0.5), (0.5%), ($2,439), (€2,439%)
+        (rf"^\(([{currency_class}]?{number}%?)\)$", False),
+        # (0.5)% and ($2,439)% (percent outside closing parenthesis)
+        (rf"^\(([{currency_class}]?{number})\)%$", True),
+        # $(2,439), €(2,439%), etc.
+        (rf"^([{currency_class}])\(({number}%?)\)$", False),
+        # $(2,439)% and €(2,439)%
+        (rf"^([{currency_class}])\(({number})\)%$", True),
+    ]
+
+    for pattern, add_percent_suffix in patterns:
+        match = re.fullmatch(pattern, normalized)
+        if not match:
+            continue
+        groups = match.groups()
+        if len(groups) == 1:
+            token = groups[0]
+        else:
+            token = "".join(groups)
+        if add_percent_suffix and not token.endswith("%"):
+            token = f"{token}%"
+        return f"-{token}"
+
+    return value
+
+
+def _is_currency_prefix_marker(value: str) -> bool:
+    return bool(re.fullmatch(r"\(?[$€£¥₹₩₽¢]\)?", _normalize_marker(value)))
+
+
+def _is_percent_suffix_marker(value: str) -> bool:
+    return _normalize_marker(value) in {"%", "%)"}
+
+
+def _has_currency_prefix(value: str) -> bool:
+    normalized = _normalize_marker(value)
+    return normalized.startswith("$") or normalized.startswith("($")
+
+
+def _has_percent_suffix(value: str) -> bool:
+    normalized = _normalize_marker(value)
+    return normalized.endswith("%") or normalized.endswith("%)")
 
 
 def _extract_columns_and_data_rows(rows: List[List[str]]) -> Tuple[List[str], List[List[str]], List[List[str]]]:
