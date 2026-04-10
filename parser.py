@@ -7,8 +7,9 @@ from bs4 import BeautifulSoup
 
 HEADERS = {"User-Agent": "1010cyl@gmail.com"}
 CURRENCY_SIGNS = "$€£¥₹₩₽¢"
+MIN_TABLE_WORDS = 0
 
-BASE_URL = "https://www.sec.gov/Archives/edgar/data/313927/000119312525260515"
+BASE_URL = "https://www.sec.gov/Archives/edgar/data/1652044/000165204426000018/goog-20251231.htm"
 FILING_URL = f"{BASE_URL}/chd-20250930.htm"
 
 
@@ -44,6 +45,8 @@ def parse_all_tables(
         padded_rows = [row + [""] * (max_width - len(row)) for row in rows]
         padded_rows = delete_empty_columns(padded_rows)
         columns, header_rows, data_rows = _extract_columns_and_data_rows(padded_rows)
+        if _count_table_words(header_rows, data_rows) <= MIN_TABLE_WORDS:
+            continue
         _normalize_parenthesized_negative_values(data_rows)
         results.append(
             {
@@ -61,6 +64,11 @@ def parse_all_tables(
         )
 
     return results
+
+
+def _count_table_words(header_rows: List[List[str]], data_rows: List[List[str]]) -> int:
+    rows = (header_rows or []) + (data_rows or [])
+    return sum(len(re.findall(r"\S+", cell or "")) for row in rows for cell in row)
 
 
 def _raw_column_names_from_headers(header_rows: List[List[str]], width: int) -> List[str]:
