@@ -34,6 +34,7 @@ def parse_all_tables(
 
     results = []
     for index, table in enumerate(soup.find_all("table")):
+        table_title = _extract_table_title(table)
         rows, max_width = _expand_table_with_spans(table)
         if not rows:
             continue
@@ -51,7 +52,7 @@ def parse_all_tables(
         results.append(
             {
                 "index": index,
-                "heading": "",
+                "title": table_title,
                 "table_html": str(table),
                 "rows": padded_rows,
                 "columns": columns,
@@ -60,10 +61,87 @@ def parse_all_tables(
                 "text": "\n".join(
                     [" | ".join(columns)] + [" | ".join(row) for row in data_rows]
                 ),
+                "textualization": table_textualization(
+                    table_title, columns, data_rows
+                ),
             }
         )
 
     return results
+
+
+def table_textualization(
+    title: str, columns: List[str], data_rows: List[List[str]]
+) -> str:
+    lines: List[str] = []
+    width = len(columns)
+    padded_rows = [row + [""] * (width - len(row)) for row in data_rows]
+
+    first_cell_prefix = ""
+    if columns:
+        first_cell_prefix = str(columns[0]).replace("\xa0", " ").strip()
+
+    # Skip first column (row-label column) from textualization iteration.
+    for col_idx, col_label in enumerate(columns[1:], start=1):
+        for row_pos in range(len(padded_rows)):
+            row = padded_rows[row_pos]
+            row_label = row[0] if row else ""
+            value = row[col_idx] if col_idx < len(row) else ""
+
+            value_cells = row[1:] if len(row) > 1 else []
+            row_empty = all(not str(cell).replace("\xa0", " ").strip() for cell in value_cells)
+            if row_empty:
+                lines.append(f"{row_label}:")
+            else:
+                if str(value).replace("\xa0", " ").strip():
+                    lines.append(f"{row_label}, {col_label} = {value}")
+
+    if lines and first_cell_prefix:
+        lines[0] = f"{first_cell_prefix}.\n{lines[0]}"
+
+    text = (title or "") + "\n" + ";".join(lines).replace(":;", ":")
+    return text
+
+
+def _extract_table_title(table_tag) -> str:
+    """
+    Find the nearest sentence-like context immediately above a table.
+    """
+    search_tags = ("p", "div", "font", "span", "b", "strong")
+    seen = set()
+    fallback = ""
+
+    for node in table_tag.find_all_previous(search_tags, limit=120):
+        if node.find_parent("table") is not None:
+            continue
+        text = re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        if not _is_probable_table_title_text(text):
+            continue
+        if not fallback:
+            fallback = text
+        if text.endswith(":") or text.endswith("."):
+            return text
+    return fallback
+
+
+def _is_probable_table_title_text(text: str) -> bool:
+    words = re.findall(r"\b\w+\b", text)
+    if len(words) < 3 or len(words) > 40:
+        return False
+    if len(text) > 260:
+        return False
+    if "|" in text:
+        return False
+    if not re.search(r"[A-Za-z]", text):
+        return False
+    if re.fullmatch(r"[\d\s,.$()%\-–—/:;]+", text):
+        return False
+    return True
 
 
 def _count_table_words(header_rows: List[List[str]], data_rows: List[List[str]]) -> int:

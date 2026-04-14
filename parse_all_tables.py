@@ -24,8 +24,8 @@ def _safe_slug(text):
     return slug.strip("_") or "table"
 
 
-def _make_sheet_name(index, heading, used_names):
-    base = f"t{index:03d}_{_safe_slug(heading)}"
+def _make_sheet_name(index, title, used_names):
+    base = f"t{index:03d}_{_safe_slug(title)}"
     # Excel worksheet names must be <= 31 chars and unique per workbook.
     base = base[:31] or f"t{index:03d}"
     candidate = base
@@ -87,7 +87,7 @@ def _write_all_tables_excel(tables, out_dir, url):
 
         width = len(columns)
         padded_data = [r + [""] * (width - len(r)) for r in data_rows]
-        sheet_name = _make_sheet_name(t["index"], t.get("heading", ""), used_sheet_names)
+        sheet_name = _make_sheet_name(t["index"], t.get("title", ""), used_sheet_names)
         ws = wb.create_sheet(title=sheet_name)
         ws.append(columns)
         for row in padded_data:
@@ -128,12 +128,12 @@ def main():
     print("=" * 80)
     for t in tables:
         print(f"\n--- Table {t['index']} ---")
-        if t["heading"]:
-            print(f"Heading: {t['heading']}")
+        if t["title"]:
+            print(f"Title: {t['title']}")
         text = t["text"]
+        textualization = t["textualization"]
+        print(textualization[:2000])
         print(text[:2000])
-        if len(text) > 2000:
-            print(f"  ... (truncated, full length {len(text)} chars)")
         print()
 
     if args.output_json:
